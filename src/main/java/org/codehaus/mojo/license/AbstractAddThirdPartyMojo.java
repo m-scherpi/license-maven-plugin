@@ -301,6 +301,13 @@ public abstract class AbstractAddThirdPartyMojo
     protected File missingFile;
 
     /**
+     * The file to write to select a specific license for dependencies with multiple licenses
+     *
+     */
+    @Parameter( property = "license.selectionFile", defaultValue = "src/license/THIRD-PARTY-SELECTION.properties" )
+    protected File selectionFile;
+
+    /**
      * The Url that holds the missing license dependency entries. This is an extension to {@link #missingFile}.
      * If set then the entries that will be found at this URL will be added additionally to the entries of the
      * missing file.<br>

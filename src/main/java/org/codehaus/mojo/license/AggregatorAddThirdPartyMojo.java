@@ -29,6 +29,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.SortedSet;
+import java.util.HashMap;
+import java.util.Iterator;
+
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.model.Plugin;
@@ -262,6 +265,29 @@ public class AggregatorAddThirdPartyMojo extends AbstractAddThirdPartyMojo
 
         consolidate();
 
+        // ----------------------------------------------------------------------
+        // Select a specified license for a library that has multiple licenses, based on a config file
+        // ----------------------------------------------------------------------
+
+        // Create new map of all libs with multiple licenses
+        // (instead of the given map of licenses with all libs using them)
+        // LIBRARY is key
+        Map<String, ArrayList<String>> libsWithMultiLicense = createMultipleLicensesMap();
+
+        // Create a map of preferred licenses for libs, configured in a file
+        // LIBRARY is key
+        Map<String, String> licensesToSelect = readLicensesToSelect();
+
+        // Collect remove candidates, sorted by license again for better comparability with final result map
+        // LICENSE is key
+        Map<String, ArrayList<String>> removeCandidates =
+            calculateRemoveCandidates( libsWithMultiLicense, licensesToSelect );
+
+        // Remove libs that have been marked as candidates
+        removeObsoleteLibraries( removeCandidates );
+
+        // ----------------------------------------------------------------------
+
         checkUnsafeDependencies();
 
         boolean safeLicense = checkForbiddenLicenses();
@@ -271,6 +297,161 @@ public class AggregatorAddThirdPartyMojo extends AbstractAddThirdPartyMojo
         writeThirdPartyFile();
 
         checkMissing( CollectionUtils.isNotEmpty( unsafeDependencies ) );
+    }
+
+
+    /*
+     * Create new map of all libs with their licenses (instead of a map of licenses with the libs using them)
+     * Contains only libs with multiple licenses
+     */
+    private Map<String, ArrayList<String>> createMultipleLicensesMap()
+    {
+        Map<String, ArrayList<String>> mapOfLibraries = new HashMap<>();
+        //this.licenseMap is the global container used by license-maven-plugin, listing all libs for a specific license
+        for ( String licenseName : licenseMap.keySet() )
+        {
+            SortedSet<MavenProject> libsWithGivenLicense = licenseMap.get( licenseName );
+            for ( MavenProject library : libsWithGivenLicense )
+            {
+                String libraryKey = library.toString();
+                //accumulate licenses for libs
+                addEntryToMap( mapOfLibraries, libraryKey, licenseName );
+            }
+        }
+
+        // remove libs with only one license to just have a map with multiple licenses
+        Iterator<Map.Entry<String, ArrayList<String>>> iter = mapOfLibraries.entrySet().iterator();
+        while ( iter.hasNext() )
+        {
+            Map.Entry<String, ArrayList<String>> entry = iter.next();
+            if ( entry.getValue().size() == 1 )
+            {
+                iter.remove();
+            }
+        }
+        // LIBRARY is key
+        return mapOfLibraries;
+    }
+
+    /*
+     * Prepare an assignment library <-> license that should be preferred if the lib has multiple licenses
+     * It is read from a properties file with the same syntax as THIRD-PARTY.properties
+     */
+    private Map<String, String> readLicensesToSelect() throws IOException
+    {
+        SortedProperties selection = new SortedProperties( encoding );
+        if ( selectionFile.exists() )
+        {
+            // load the selection file
+            selection.load( selectionFile );
+        }
+
+        Map<String, String> licensesToSelect = new HashMap<>();
+        for ( String libraryWithVersion : selection.stringPropertyNames() )
+        {
+            String license = selection.getProperty( libraryWithVersion );
+            String libKey = libraryWithVersion.replace( "--", ":" );
+            //mock MavenProject.toString() for better comparability
+            licensesToSelect.put( "MavenProject: " + libKey + " @ ", license );
+        }
+        // LIBRARY is key
+        return licensesToSelect;
+    }
+
+
+    /*
+     * Find remove candidates that should not be written in result file.
+     * Remove candidate means that a selection for a given library is present, so any other license is obsolete
+     */
+    private Map<String, ArrayList<String>> calculateRemoveCandidates(
+        Map<String, ArrayList<String>> libsWithMultiLicense, Map<String, String> licensesToSelectForLibs )
+    {
+        Map<String, ArrayList<String>> libsToRemove = new HashMap<>();
+        for ( String libraryKey : licensesToSelectForLibs.keySet() )
+        {
+            if ( libsWithMultiLicense.containsKey( libraryKey ) )
+            {
+                ArrayList<String> listOfLibsForLicense = libsWithMultiLicense.get( libraryKey );
+                String selectedLicense = licensesToSelectForLibs.get( libraryKey );
+                // selected license does not match any present license for lib, so no removal at all
+                if ( !listOfLibsForLicense.remove( selectedLicense ) )
+                {
+                    continue;
+                }
+                // Any license left is not selected, so it has to be removed
+                for ( String licenseName: listOfLibsForLicense )
+                {
+                    //accumulate libs for licenses
+                    addEntryToMap( libsToRemove, licenseName, libraryKey );
+                }
+
+                libsWithMultiLicense.remove( libraryKey );
+            }
+        }
+
+        if ( libsWithMultiLicense.size() > 0 )
+        {
+            LOG.info( "Some libraries have multiple licenses. Choose one and add it to " + selectionFile );
+        }
+        for ( String libRemaining : libsWithMultiLicense.keySet() )
+        {
+            ArrayList<String> licensesRemaining = libsWithMultiLicense.get( libRemaining );
+            LOG.warn( libRemaining.replace( "MavenProject: ", "" )
+                .replace( " @", " ->" )
+                + licensesRemaining.toString() );
+        }
+
+        // LICENSE is key
+        return libsToRemove;
+    }
+
+    /*
+     * Licenses that have been marked to be removed from global container will be removed
+     * Any entry left will be written to result file
+     */
+    private void removeObsoleteLibraries( Map<String, ArrayList<String>> removeCandidates )
+    {
+        for ( String licenseKey: removeCandidates.keySet() )
+        {
+            //this.licenseMap is the global container used by license-maven-plugin,
+            // listing all libs for a specific license
+            if ( licenseMap.containsKey( licenseKey ) )
+            {
+                ArrayList<String> librariesToRemove = removeCandidates.get( licenseKey );
+                SortedSet<MavenProject> librariesForGivenLicense = licenseMap.get( licenseKey );
+
+                List<MavenProject> toRemove = new ArrayList<>();
+                for ( MavenProject library : librariesForGivenLicense )
+                {
+                    if ( librariesToRemove.contains( library.toString() ) )
+                    {
+                        toRemove.add( library ) ;
+                    }
+                }
+                for ( MavenProject removeCandidate: toRemove )
+                {
+                    librariesForGivenLicense.remove( removeCandidate );
+                }
+            }
+        }
+    }
+
+    /*
+     * Match a given key with an entry, accumulate entries if the key already has some
+     */
+    private void addEntryToMap( Map<String, ArrayList<String>> resultMap, String key, String entry )
+    {
+        if ( !resultMap.containsKey( key ) )
+        {
+            ArrayList<String> initialListOfEntries = new ArrayList<>();
+            initialListOfEntries.add( entry );
+            resultMap.put( key, initialListOfEntries );
+        }
+        else
+        {
+            ArrayList<String> listOfEntries = resultMap.get( key );
+            listOfEntries.add( entry );
+        }
     }
 
     // ----------------------------------------------------------------------
